@@ -18,6 +18,7 @@ from tqdm import tqdm
 import argparse
 import json
 import timm
+from timm.utils import ModelEmaV3
 
 class SemanticImageDataset(Dataset):
     def __init__(self, json_file, data_path, transform=None):
@@ -107,7 +108,7 @@ def compute_iou(pred, target, num_classes=2):
 
     return sum(ious) / len(ious) if ious else 0.0
 
-def train(model, train_loader, optimizer, scaler, device, classes=2):
+def train(model, train_loader, optimizer, scaler, device, ema, classes=2):
     model.train()
 
     total_loss = 0.0
@@ -133,6 +134,7 @@ def train(model, train_loader, optimizer, scaler, device, classes=2):
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
+        ema.update(model)
 
         preds = logits.argmax(dim=1)
 
@@ -192,7 +194,7 @@ if __name__ == "__main__":
     checkpoint_path = "models/segmentation"
     model_name = "model"
     encoder_weights = "models/supervised/encoder_v2.pt"
-    use_prev_weights = False
+    prev_weights = None
     
     # Ensure output directory exists
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
@@ -258,14 +260,13 @@ if __name__ == "__main__":
     print(f"Image classifcation with ConvNeXt backbone")
 
     model = ConvNeXtV2UPerNet(num_classes=2, encoder_weights=encoder_weights).to(device)
-    if use_prev_weights:
-        checkpoint = torch.load("models/supervised_classifier_model.pt",  map_location="cpu", weights_only=False)
+    if prev_weights:
+        checkpoint = torch.load(prev_weights,  map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"])
-        checkpoint = torch.load(encoder_weights,  map_location="cpu", weights_only=True)
-        model.encoder.load_state_dict(checkpoint)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4,weight_decay=0.05)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     scaler = torch.amp.GradScaler(device)
+    ema = ModelEmaV3(model, decay=0.9999)
 
     best_val_loss = float('inf')
     epoch = 0
@@ -289,8 +290,8 @@ if __name__ == "__main__":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs-epoch)
         
 
-        train_loss, train_iou = train(model, train_loader, optimizer, scaler, device)
-        val_loss, val_iou = validate(model, val_loader, device)
+        train_loss, train_iou = train(model, train_loader, optimizer, scaler, ema.module, device)
+        val_loss, val_iou = validate(ema.module, val_loader, device)
         scheduler.step()
         
         print(f"Epoch {epoch+1}/{epochs} - LR: {optimizer.param_groups[0]['lr']:.6f}")
@@ -301,7 +302,7 @@ if __name__ == "__main__":
             best_val_loss = val_loss
             torch.save({
                 "epoch": epoch,
-                "model": model.state_dict(),
+                "model": ema.module.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
             }, f"{checkpoint_path}/{model_name}.pt")
