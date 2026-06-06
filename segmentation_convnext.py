@@ -8,6 +8,7 @@ from torchvision import transforms, models
 from torchvision.transforms import v2
 from segmentation_models_pytorch.decoders.upernet.decoder import UPerNetDecoder
 from segmentation_models_pytorch.base import SegmentationHead
+from segmentation_models_pytorch.losses import DiceLoss
 import torchvision.transforms.functional as TF
 from torchvision import tv_tensors
 from PIL import Image
@@ -112,7 +113,8 @@ def train(model, train_loader, optimizer, scaler, device, classes=2):
     total_loss = 0.0
     total_iou = 0.0
     count = 0
-
+    
+    dice_loss_func = DiceLoss(mode="binary", from_logits=True)
     pbar = tqdm(train_loader, desc="Training")
 
     for images, masks in pbar:
@@ -123,7 +125,10 @@ def train(model, train_loader, optimizer, scaler, device, classes=2):
 
         with torch.autocast(device_type='cuda', dtype=torch.float16):
             logits = model(images)
-            loss = torch.nn.functional.cross_entropy(logits, masks)
+            ce_loss = torch.nn.functional.cross_entropy(logits, masks)
+            foreground_logits = logits[:, 1:2]
+            dice_loss = dice_loss_func(foreground_logits, masks)
+            loss = ce_loss + dice_loss
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -151,6 +156,7 @@ def validate(model, val_loader, device):
     total_iou = 0.0
     count = 0
 
+    dice_loss_func = DiceLoss(mode="binary", from_logits=True)
     with torch.no_grad():
         pbar = tqdm(val_loader, desc="Validating")
 
@@ -160,8 +166,10 @@ def validate(model, val_loader, device):
 
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 logits = model(images)
-
-                loss = torch.nn.functional.cross_entropy(logits, masks)
+                ce_loss = torch.nn.functional.cross_entropy(logits, masks)
+                foreground_logits = logits[:, 1:2]
+                dice_loss = dice_loss_func(foreground_logits, masks)
+                loss = ce_loss + dice_loss
 
             preds = logits.argmax(dim=1)
             iou = compute_iou(preds, masks, num_classes=2)
@@ -179,10 +187,11 @@ def validate(model, val_loader, device):
 
 if __name__ == "__main__":
     batch_size = 32
-    epochs = 20
+    epochs = 50
+    unfreeze_epoch = 15
     checkpoint_path = "models/segmentation"
     model_name = "model"
-    encoder_weights = "models/ssl/encoder_30.pt"
+    encoder_weights = "models/supervised/encoder_v2.pt"
     use_prev_weights = False
     
     # Ensure output directory exists
@@ -248,7 +257,7 @@ if __name__ == "__main__":
     # Create model
     print(f"Image classifcation with ConvNeXt backbone")
 
-    model = ConvNeXtV2UPerNet(num_classes=300, encoder_weights=encoder_weights).to(device)
+    model = ConvNeXtV2UPerNet(num_classes=2, encoder_weights=encoder_weights).to(device)
     if use_prev_weights:
         checkpoint = torch.load("models/supervised_classifier_model.pt",  map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"])
@@ -258,19 +267,38 @@ if __name__ == "__main__":
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     scaler = torch.amp.GradScaler(device)
 
-    best_val_acc = 0.0
+    best_val_loss = float('inf')
     epoch = 0
+
+    #freeze encoder intially to allow for decoder/head to learn
+    for param in model.encoder.parameters():
+        param.requires_grad = False
     for epoch in range(epochs):
-        train_loss, train_acc = train(model, train_loader, optimizer, scaler, device)
-        val_loss, val_acc = validate(model, val_loader, device)
+        if (epoch+1) == unfreeze_epoch:
+            print("Unfreezing encoder")
+            for param in model.encoder.parameters():
+                param.requires_grad = True
+            optimizer = torch.optim.AdamW(
+                [   
+                    {"params": model.encoder.parameters(), "lr": 1e-4,}, 
+                    {"params": model.decoder.parameters(), "lr": 3e-4,},
+                    {"params": model.segmentation_head.parameters(), "lr": 3e-4,}
+                ],
+                weight_decay=0.05
+            )
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs-epoch)
+        
+
+        train_loss, train_iou = train(model, train_loader, optimizer, scaler, device)
+        val_loss, val_iou = validate(model, val_loader, device)
         scheduler.step()
         
         print(f"Epoch {epoch+1}/{epochs} - LR: {optimizer.param_groups[0]['lr']:.6f}")
-        print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-        print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+        print(f"Train Loss: {train_loss:.4f}, Train IOU: {train_iou:.2f}")
+        print(f"Val Loss: {val_loss:.4f}, Val IOU: {val_iou:.2f}")
         # Save checkpoint
-        if best_val_acc < val_acc:
-            best_val_acc = val_acc
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             torch.save({
                 "epoch": epoch,
                 "model": model.state_dict(),
@@ -280,14 +308,6 @@ if __name__ == "__main__":
 
             print(f"Saved checkpoint")
     
-    print(f"Saved model to {checkpoint_path}/{model_name}.pt")
-    torch.save({
-        "epoch": epoch,
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-    }, f"{checkpoint_path}/{model_name}.pt")
-
 
 
 

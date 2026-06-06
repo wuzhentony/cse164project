@@ -13,53 +13,12 @@ from tqdm import tqdm
 import argparse
 import json
 import timm
+from timm.utils import ModelEmaV3
+import torch.nn.functional as F
+from supervised_convnext.py import LabeledImageDataset, ConvNeXtClassifier
 
-class LabeledImageDataset(Dataset):
-    def __init__(self, json_file, data_path, transform=None):
-        with open(json_file, 'r') as f:
-            self.samples = json.load(f)
-        self.data_path = data_path
-        self.transform = transform
-        
-    def __len__(self):
-        return len(self.samples)
-    
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        image_path = os.path.join(self.data_path, sample['image'])
-        label = sample['class_id']
-        image = Image.open(image_path).convert('RGB')
-        image = self.transform(image)
-        return image, label
 
-class ConvNeXtClassifier(nn.Module):
-    def __init__(self, num_classes=300, encoder_weights=None, freeze_encoder=True, drop_path_rate=0.2):
-        super().__init__()
-
-        # self.encoder = convnext_tiny(weights='ConvNeXt_Tiny_Weights.DEFAULT').features
-        self.encoder = timm.create_model("convnextv2_tiny.fcmae",pretrained=False,features_only=True)
-        if encoder_weights:
-            checkpoint = torch.load(encoder_weights, map_location="cpu", weights_only=True)
-            self.encoder.load_state_dict(checkpoint)
-        if freeze_encoder:
-            for param in self.encoder.parameters():
-                param.requires_grad = False
-        # self.head = nn.Linear(768, num_classes)
-        self.head = nn.Sequential(
-            nn.Linear(768, 512),
-            nn.GELU(),
-            nn.Linear(512, 256),
-            nn.GELU(),
-            nn.Linear(256, num_classes)
-        )
-
-    def forward(self, images):
-        x = self.encoder(images)[-1]
-        x = x.mean(dim=(-2, -1)) # global average pooling
-        x = self.head(x)
-        return x
-
-def train(model, train_loader, optimizer, scaler, device):
+def train(model, train_loader, optimizer, scaler, device, ema):
     model.train()
 
     total_loss = 0.0
@@ -76,10 +35,14 @@ def train(model, train_loader, optimizer, scaler, device):
 
         with torch.autocast(device_type='cuda', dtype=torch.float16):
             outputs = model(images)
-            loss = torch.nn.functional.cross_entropy(outputs, labels)
+            if labels.ndim == 2:
+                loss = F.cross_entropy(outputs, labels)
+            else:
+                loss = F.cross_entropy(outputs,labels,label_smoothing=0.1)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
+        ema.update(model)
         total_loss += loss.item()
         predicted = outputs.argmax(dim=1)
         if labels.ndim == 2:  # CutMix labels
@@ -133,34 +96,34 @@ def validate(model, val_loader, device):
     return avg_loss, accuracy
 
 if __name__ == "__main__":
-    batch_size = 128
-    epochs = 100
+    batch_size = 64
+    epochs = 50
     checkpoint_path = "models/supervised"
-    encoder_name = "encoder_v2"
-    model_name = "model_v2"
-    encoder_weights = None # "models/ssl/encoder_40.pt"
-    prev_weights = "models/supervised/model.pt"
-    unfreeze_epoch = 20 
+    encoder_name = "encoder_test"
+    model_name = "model_test"
+    encoder_weights = "models/ssl/encoder_40.pt"
+    prev_weights = None #"models/supervised/encoder.pt"
     drop_path_rate = 0.2
     
     # Ensure output directory exists
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
+    print(device)
     # make datasets with randaugment
     data_path = Path('/home/tony/.cache/kagglehub/competitions/cse-164-final-project-2026/data')
     train_path = data_path 
     train_json = data_path / 'metadata/train_labeled.json'
     val_path = data_path / 'val/images'
     val_json = data_path / 'val/classification.json'
-    
 
     train_dataset = LabeledImageDataset(
         data_path=train_path,
         json_file=train_json,
         transform = v2.Compose([
-            v2.Resize((224, 224)),
             v2.ToImage(),
+            v2.Resize((224,224)),
+            # v2.RandomResizedCrop(224, scale=(0.6, 1.0)),
+            # v2.RandomHorizontalFlip(),
             v2.RandAugment(num_ops=2, magnitude=7),
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(
@@ -169,6 +132,7 @@ if __name__ == "__main__":
             ),
         ])
     )
+
 
     val_dataset = LabeledImageDataset(
         data_path=val_path,
@@ -185,10 +149,12 @@ if __name__ == "__main__":
     )
 
     # make dataloaders with cutmix 
-    cutmix = v2.CutMix(num_classes=300)
-    def collate_fn(batch):
-        images, labels = torch.utils.data.default_collate(batch)
-        return cutmix(images, labels)
+    # mixup = v2.MixUp(num_classes=300)
+    # cutmix = v2.CutMix(num_classes=300)
+    # mixupcutmix = v2.RandomChoice([mixup, cutmix])
+    # def collate_fn(batch):
+    #     images, labels = torch.utils.data.default_collate(batch)
+    #     return mixupcutmix(images, labels)
     
     train_loader = DataLoader(
         train_dataset,
@@ -196,7 +162,7 @@ if __name__ == "__main__":
         shuffle=True,
         num_workers=4,
         pin_memory=True,
-        collate_fn=collate_fn,
+        #collate_fn=collate_fn,
     )
 
     val_loader = DataLoader(
@@ -206,36 +172,27 @@ if __name__ == "__main__":
         num_workers=4,
         pin_memory=True,
     )
+
     
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
     # Create model
     print(f"Image classifcation with ConvNeXt backbone")
 
-    freeze_encoder = unfreeze_epoch > 1
-    model = ConvNeXtClassifier(encoder_weights=encoder_weights, freeze_encoder=freeze_encoder, drop_path_rate=drop_path_rate).to(device)
+    model = ConvNeXtClassifier(encoder_weights=encoder_weights).to(device)
     if prev_weights:
         checkpoint = torch.load(prev_weights,  map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"])
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4,weight_decay=0.05)
+        checkpoint = torch.load(encoder_weights,  map_location="cpu", weights_only=True)
+        model.encoder.load_state_dict(checkpoint)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4,weight_decay=0.05)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    ema = ModelEmaV3(model, decay=0.9999)
     scaler = torch.amp.GradScaler(device)
 
     best_val_acc = 0.0
     for epoch in range(epochs):
-        if (epoch+1) == unfreeze_epoch:
-            print("Unfreezing encoder")
-            for param in model.encoder.parameters():
-                param.requires_grad = True
-
-            optimizer = torch.optim.AdamW(
-                [{"params": model.encoder.parameters(), "lr": 1e-4,}, {"params": model.head.parameters(), "lr": 3e-4,}],
-                weight_decay=0.05
-            )
-
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs-epoch)
-        
-        train_loss, train_acc = train(model, train_loader, optimizer, scaler, device)
+        train_loss, train_acc = train(model, train_loader, optimizer, scaler, device, ema)
         val_loss, val_acc = validate(model, val_loader, device)
         scheduler.step()
         

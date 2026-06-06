@@ -41,17 +41,19 @@ class ImageFolderDataset(Dataset):
 
 
 class ConvNeXtSSL(nn.Module):
-    def __init__(self, mask_ratio=0.75, patch_size=16, decoder_dim=512):
+    def __init__(self, mask_ratio=0.75, patch_size=16, decoder_dim=256, decoder_depth=1, drop_path_rate=0.1):
         super().__init__()
         self.mask_ratio = mask_ratio
         self.patch_size = patch_size
-        self.encoder = timm.create_model("convnextv2_tiny.fcmae",pretrained=False,features_only=True)
+        self.encoder = timm.create_model(
+            "convnextv2_tiny.fcmae",
+            pretrained=False,features_only=True,
+            drop_path_rate=drop_path_rate
+        )
         encoder_dim = self.encoder.feature_info.channels()[-2] + self.encoder.feature_info.channels()[-1] 
         self.proj = nn.Conv2d(encoder_dim,decoder_dim,kernel_size=1)
         self.decoder = nn.Sequential(
-            Block(decoder_dim),
-            Block(decoder_dim),
-            Block(decoder_dim),
+            Block(decoder_dim) for i in range(decoder_depth)
         )        
         self.pred = nn.Conv2d(decoder_dim, patch_size*patch_size*3, kernel_size=1)
 
@@ -137,12 +139,13 @@ def train(model, patch_size, train_loader, optimizer, scaler, device):
 
 if __name__ == "__main__":
     batch_size = 128
-    epochs = 50
+    epochs = 30
     checkpoint_path = "models/ssl"
     encoder_name = "encoder"
     model_name = "model"
-    mask_ratio = 0.6
+    mask_ratio = 0.75
     patch_size = 16
+    drop_path_rate = 0.1
     
     # Ensure output directory exists
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
@@ -157,9 +160,9 @@ if __name__ == "__main__":
     # Transforms
     transform = transforms.Compose([
         transforms.RandomResizedCrop(224, scale=(0.5,1.0)),
-        # transforms.RandomHorizontalFlip(0.5),
-        # transforms.RandomVerticalFlip(0.2),
-        # transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        transforms.RandomHorizontalFlip(0.5),
+        #transforms.RandomVerticalFlip(0.2),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
         transforms.ToTensor(),
         transforms.Normalize(
             mean=[0.485, 0.456, 0.406],
@@ -187,19 +190,11 @@ if __name__ == "__main__":
         num_workers=4,
         pin_memory=True
     )
-
-    # test_loader = DataLoader(
-    #     test_dataset,
-    #     batch_size=batch_size,
-    #     shuffle=False,
-    #     num_workers=4,
-    #     pin_memory=True
-    # )
     
     # Create model
     print(f"Training ConvNeXt encoder")
 
-    model = ConvNeXtSSL(mask_ratio=mask_ratio, patch_size=patch_size).to(device)
+    model = ConvNeXtSSL(mask_ratio=mask_ratio, patch_size=patch_size, drop_path_rate=drop_path_rate).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4,weight_decay=0.05)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     scaler = torch.amp.GradScaler("cuda")
