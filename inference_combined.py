@@ -145,6 +145,37 @@ class CombinedInference:
 
         return predicted_class, output_mask
     
+    @torch.no_grad()
+    def interpolate_inference(self, image_path):
+        """
+        Returns:
+            mask: HxW array
+                0 = background
+                predicted_class + 1 = foreground
+        """
+        image = Image.open(image_path).convert("RGB")
+        orig_width, orig_height = image.size
+        print(f"  Processing image: {orig_width}x{orig_height}")
+
+        #classification
+        full_image_tensor = (self.transform(image).unsqueeze(0).to(self.device))
+        clf_logits = self.clf_model(full_image_tensor)
+
+        predicted_class = clf_logits.argmax(dim=1).item()
+        class_value = predicted_class + 1
+
+        print(f"  Predicted class: {predicted_class} -> mask value: {class_value}")
+        logits = self.seg_model(full_image_tensor)
+        logits_resized = F.interpolate(
+            logits,
+            size=((orig_height, orig_width)),
+            mode="bilinear",
+            align_corners=False
+        )
+        preds = logits_resized.argmax(dim=1) * class_value
+        pred_mask = preds.squeeze(0).cpu().numpy()
+        return predicted_class, pred_mask
+    
     def save_mask_as_image(self, mask, output_path):
         """Save mask as PNG with color mapping"""
         # Create RGB image from mask
@@ -200,8 +231,8 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Paths
-    seg_model_path = "/home/tony/project/models/segmentation/model.pt"
-    clf_model_path = "/home/tony/project/models/supervised/model_v2.pt"
+    seg_model_path = "/home/tony/project/models/segmentation/model_1.pt"
+    clf_model_path = "/home/tony/project/models/supervised/model_v3.pt"
     # test_images_dir = Path("/home/tony/.cache/kagglehub/competitions/cse-164-final-project-2026/data/test/images")
     test_images_dir = Path("/home/tony/.cache/kagglehub/competitions/cse-164-final-project-2026/data/val/images")
     output_dir = Path("/home/tony/project/test_predictions")
@@ -228,6 +259,7 @@ def main():
             image_name = image_path.name
             # Run inference
             class_id, mask = inference.sliding_window_inference(str(image_path))
+            # class_id, mask = inference.interpolate_inference(str(image_path))
             segmentation_rle = encode_mask_ids(mask)
             if len(segmentation_rle) < 1:
                 segmentation_rle = f"1 1 {class_id+1}"

@@ -24,7 +24,6 @@ class SemanticImageDataset(Dataset):
     def __init__(self, json_file, data_path, transform=None):
         with open(json_file, 'r') as f:
             self.samples = json.load(f)
-
         self.data_path = data_path
         self.transform = transform
 
@@ -33,11 +32,9 @@ class SemanticImageDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-
         # image
         image_path = os.path.join(self.data_path, sample['image'])
         image = Image.open(image_path).convert('RGB')
-
         # mask
         mask_path = os.path.join(self.data_path, sample['mask'])
         mask = np.asarray(Image.open(mask_path).convert("RGB"), dtype=np.int32)
@@ -47,13 +44,42 @@ class SemanticImageDataset(Dataset):
         mask = (mask != 0).astype(np.int64)   # binary segmentation
         mask = tv_tensors.Mask(mask)
 
-        # apply image-only transforms
         if self.transform:
             image, mask = self.transform(image, mask)
 
         mask = mask.to(torch.long)
 
         return image, mask
+
+class SemanticEvalDataset(Dataset):
+    def __init__(self, json_file, data_path, transform=None):
+        with open(json_file, 'r') as f:
+            self.samples = json.load(f)
+        self.data_path = data_path
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        # image
+        image_path = os.path.join(self.data_path, sample['image'])
+        image = Image.open(image_path).convert('RGB')
+        # mask
+        mask_path = os.path.join(self.data_path, sample['mask'])
+        mask = np.asarray(Image.open(mask_path).convert("RGB"), dtype=np.int32)
+
+        mask = mask[:, :, 0] + 256 * mask[:, :, 1]
+        mask[mask == 1000] = 0
+        mask = (mask != 0).astype(np.int64)   # binary segmentation
+        mask = torch.from_numpy(mask).long()
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, mask, mask.shape[-2:]
+
 
 class ConvNeXtV2UPerNet(nn.Module):
     def __init__(self, num_classes, encoder_weights=None):
@@ -93,22 +119,31 @@ class ConvNeXtV2UPerNet(nn.Module):
 
 def compute_iou(pred, target, num_classes=2):
     ious = []
-
     for cls in range(num_classes):
         pred_i = (pred == cls)
         target_i = (target == cls)
-
         intersection = (pred_i & target_i).sum().item()
         union = (pred_i | target_i).sum().item()
-
         if union == 0:
             continue
-
         ious.append(intersection / union)
-
     return sum(ious) / len(ious) if ious else 0.0
 
-def train(model, train_loader, optimizer, scaler, device, ema, classes=2):
+def boundary_weight(masks, width=3, alpha=4.0):
+    """
+    labels: [B,H,W] integer class labels
+
+    returns:
+        boundary: [B,H,W] float tensor (0 or 1)
+    """
+    x = masks.float().unsqueeze(1)  # [B,1,H,W]
+    dilated = F.max_pool2d(x,kernel_size=width,stride=1,padding=width // 2)
+    eroded = -F.max_pool2d(-x,kernel_size=width,stride=1,padding=width // 2)
+    boundary = (dilated != eroded).float()
+    weight_map = 1.0 + alpha * boundary #weight the boundaries by a factor of alpha
+    return weight_map
+
+def train(model, train_loader, optimizer, scaler, ema, alpha, device, classes=2):
     model.train()
 
     total_loss = 0.0
@@ -126,6 +161,7 @@ def train(model, train_loader, optimizer, scaler, device, ema, classes=2):
 
         with torch.autocast(device_type='cuda', dtype=torch.float16):
             logits = model(images)
+            boundary_weights = boundary_weight(masks, alpha=alpha)
             ce_loss = torch.nn.functional.cross_entropy(logits, masks)
             foreground_logits = logits[:, 1:2]
             dice_loss = dice_loss_func(foreground_logits, masks)
@@ -162,18 +198,24 @@ def validate(model, val_loader, device):
     with torch.no_grad():
         pbar = tqdm(val_loader, desc="Validating")
 
-        for images, masks in pbar:
+        for images, masks, shape in pbar:
             images = images.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
-
+            
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 logits = model(images)
-                ce_loss = torch.nn.functional.cross_entropy(logits, masks)
-                foreground_logits = logits[:, 1:2]
+                logits_resized = F.interpolate(
+                    logits,
+                    size=shape,
+                    mode="bilinear",
+                    align_corners=False
+                )
+                ce_loss = torch.nn.functional.cross_entropy(logits_resized, masks)
+                foreground_logits = logits_resized[:, 1:2]
                 dice_loss = dice_loss_func(foreground_logits, masks)
                 loss = ce_loss + dice_loss
 
-            preds = logits.argmax(dim=1)
+            preds = logits_resized.argmax(dim=1)
             iou = compute_iou(preds, masks, num_classes=2)
 
             total_loss += loss.item()
@@ -188,19 +230,20 @@ def validate(model, val_loader, device):
     return total_loss / count, total_iou / count
 
 if __name__ == "__main__":
-    batch_size = 32
-    epochs = 50
-    unfreeze_epoch = 15
+    batch_size = 64
+    epochs = 30
+    unfreeze_epoch = 1
     checkpoint_path = "models/segmentation"
-    model_name = "model"
-    encoder_weights = "models/supervised/encoder_v2.pt"
-    prev_weights = None
+    model_name = "model_v2"
+    encoder_weights = None# "models/supervised/encoder_v2.pt"
+    prev_weights = "models/segmentation/model_1.pt"
+    alpha = 4.0 #weight for boundary pixels
     
     # Ensure output directory exists
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # make datasets with randaugment
+    # make datasets
     data_path = Path('/home/tony/.cache/kagglehub/competitions/cse-164-final-project-2026/data')
     train_path = data_path 
     train_json = data_path / 'metadata/train_seg.json'
@@ -209,7 +252,7 @@ if __name__ == "__main__":
 
     train_transform = v2.Compose([
         v2.ToImage(),
-        v2.RandomCrop(224, 224),
+        v2.RandomResizedCrop(224, scale=(0.8,1.0)),
         v2.RandomHorizontalFlip(p=0.5),
         v2.ToDtype(torch.float32, scale=True),
         v2.Normalize(
@@ -224,11 +267,13 @@ if __name__ == "__main__":
         transform = train_transform
     )
 
-    val_dataset = SemanticImageDataset(
+
+    val_dataset = SemanticEvalDataset(
         data_path=val_path,
         json_file=val_json,
         transform=v2.Compose([
             v2.Resize((224,224)),
+            #v2.CenterCrop(224)
             v2.ToImage(),
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(
@@ -246,9 +291,10 @@ if __name__ == "__main__":
         pin_memory=True,
     )
 
+
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
+        batch_size=1, #due to varying sizes of masks
         shuffle=False,
         num_workers=4,
         pin_memory=True,
@@ -290,7 +336,7 @@ if __name__ == "__main__":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs-epoch)
         
 
-        train_loss, train_iou = train(model, train_loader, optimizer, scaler, ema.module, device)
+        train_loss, train_iou = train(model, train_loader, optimizer, scaler, ema, alpha, device)
         val_loss, val_iou = validate(ema.module, val_loader, device)
         scheduler.step()
         

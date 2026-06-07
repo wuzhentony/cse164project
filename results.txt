@@ -1,0 +1,27 @@
+submit 1: 0.10634
+segmenter - model_1.pt
+supervised - model_1.pt
+{
+  "automated_score": 0.11344389346255687,
+  "boundary_f_score": 0.17072677483592125,
+  "classification_macro_accuracy": 0.21611111111111114,
+  "mean_iou": 0.0854407322335589,
+  "rare_class_miou": 0.06362805669802596,
+  "segmentation_score": 0.10031667320047807
+}
+
+python starter/validate_submission_csv.py \
+  --submission val_submission.csv \
+  --data-root /home/tony/.cache/kagglehub/competitions/cse-164-final-project-2026/data \
+  --split val
+
+segmenter - model_1.pt
+supervised - model_v3.pt
+{
+  "automated_score": 0.126084711628409,
+  "boundary_f_score": 0.17072677483592125,
+  "classification_macro_accuracy": 0.25833333333333336,
+  "mean_iou": 0.09379170422478086,
+  "rare_class_miou": 0.06511944877958208,
+  "segmentation_score": 0.10631149280248907
+}
