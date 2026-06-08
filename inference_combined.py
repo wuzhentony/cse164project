@@ -36,6 +36,12 @@ class CombinedInference:
         clf_checkpoint = torch.load(clf_model_path, map_location="cpu", weights_only=False)
         self.clf_model.load_state_dict(clf_checkpoint["model"])
         self.clf_model.eval()
+
+        # from goat_classifier import GoodClassifier
+        # self.clf_model = GoodClassifier().to(device)
+        # clf_checkpoint = torch.load('models/supervised/goat_classifier.pt', map_location="cpu", weights_only=False)
+        # self.clf_model.load_state_dict(clf_checkpoint["model"])
+        # self.clf_model.eval()
         
         # Preprocessing
         self.transform = v2.Compose([
@@ -231,10 +237,10 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Paths
-    seg_model_path = "/home/tony/project/models/segmentation/model_1.pt"
-    clf_model_path = "/home/tony/project/models/supervised/model_v3.pt"
-    # test_images_dir = Path("/home/tony/.cache/kagglehub/competitions/cse-164-final-project-2026/data/test/images")
-    test_images_dir = Path("/home/tony/.cache/kagglehub/competitions/cse-164-final-project-2026/data/val/images")
+    seg_model_path = "/home/tony/project/models/segmentation/model_v2.pt"
+    clf_model_path = "/home/tony/project/models/semi_supervised/pseudo_model_v3.pt"
+    test_images_dir = Path("/home/tony/.cache/kagglehub/competitions/cse-164-final-project-2026/data/test/images")
+    # test_images_dir = Path("/home/tony/.cache/kagglehub/competitions/cse-164-final-project-2026/data/val/images")
     output_dir = Path("/home/tony/project/test_predictions")
     submit_name = "val_submission.csv"
     

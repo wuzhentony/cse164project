@@ -78,7 +78,7 @@ def train(model, train_loader, optimizer, scaler, ema, device):
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
-        ema.update(model)
+        #ema.update(model)
         total_loss += loss.item()
         predicted = outputs.argmax(dim=1)
         if labels.ndim == 2:  # CutMix labels
@@ -132,7 +132,7 @@ def validate(model, val_loader, device):
     return avg_loss, accuracy
 
 if __name__ == "__main__":
-    batch_size = 128
+    batch_size = 64
     epochs = 20
     checkpoint_path = "models/supervised"
     encoder_name = "encoder_v4"
@@ -143,7 +143,7 @@ if __name__ == "__main__":
     drop_path_rate = 0.2
     
     # Ensure output directory exists
-    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    #os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # make datasets with randaugment
@@ -238,7 +238,7 @@ if __name__ == "__main__":
 
     for param in model.encoder.parameters():
         param.requires_grad = False
-    best_val_acc = 0.0
+    best_val_loss = float('inf')
     for epoch in range(epochs):
         if (epoch+1) == unfreeze_epoch:
             print("Unfreezing encoder")
@@ -254,21 +254,21 @@ if __name__ == "__main__":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs-epoch)
         
         train_loss, train_acc = train(model, train_loader, optimizer, scaler, ema, device)
-        val_loss, val_acc = validate(ema.module, val_loader, device)
+        val_loss, val_acc = validate(model, val_loader, device)
         scheduler.step()
         
         print(f"Epoch {epoch+1}/{epochs} - LR: {optimizer.param_groups[0]['lr']:.6f}")
         print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
         print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
         # Save checkpoint
-        if best_val_acc < val_acc:
-            best_val_acc = val_acc
+        if best_val_loss > val_loss:
+            best_val_loss = val_loss
             torch.save({
                 "epoch": epoch,
-                "model": ema.module.state_dict(),
+                "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
             }, f"{checkpoint_path}/{model_name}.pt")
 
-            torch.save(ema.module.encoder.state_dict(), f"{checkpoint_path}/{encoder_name}.pt")
+            torch.save(model.encoder.state_dict(), f"{checkpoint_path}/{encoder_name}.pt")
             print(f"Saved checkpoint")

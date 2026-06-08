@@ -20,6 +20,10 @@ import json
 import timm
 from timm.utils import ModelEmaV3
 
+import torch
+import numpy as np
+from PIL import Image
+
 class SemanticImageDataset(Dataset):
     def __init__(self, json_file, data_path, transform=None):
         with open(json_file, 'r') as f:
@@ -117,17 +121,39 @@ class ConvNeXtV2UPerNet(nn.Module):
         x = self.segmentation_head(x)
         return x
 
-def compute_iou(pred, target, num_classes=2):
-    ious = []
-    for cls in range(num_classes):
-        pred_i = (pred == cls)
-        target_i = (target == cls)
-        intersection = (pred_i & target_i).sum().item()
-        union = (pred_i | target_i).sum().item()
-        if union == 0:
-            continue
-        ious.append(intersection / union)
-    return sum(ious) / len(ious) if ious else 0.0
+
+def compute_iou(pred, target, num_classes=2, eps=1e-7):
+    B = pred.shape[0]
+    image_ious = []
+    for b in range(B):
+        class_ious = []
+        for cls in range(num_classes):
+            pred_i = pred[b] == cls
+            target_i = target[b] == cls
+            intersection = (pred_i & target_i).sum().float()
+            union = (pred_i | target_i).sum().float()
+            if union == 0:
+                class_ious.append(torch.tensor(1.0, device=pred.device))
+            else:
+                class_ious.append(intersection / (union + eps))
+        image_ious.append(torch.stack(class_ious).mean())
+    return torch.stack(image_ious).mean().item()
+
+# def compute_iou(pred, target, num_classes=2):
+    # ious = []
+    # for cls in range(num_classes):
+    #     pred_i = (pred == cls)
+    #     target_i = (target == cls)
+    #     intersection = (pred_i & target_i).sum().item()
+    #     union = (pred_i | target_i).sum().item()
+    #     ious.append(intersection / (union + 1e-7))
+    # return sum(ious) / len(ious) if ious else 0.0
+
+def get_boundary(mask, width=3):
+    x = mask.float().unsqueeze(1)
+    eroded = -F.max_pool2d(-x,kernel_size=width,stride=1,padding=1)
+    boundary = (x != eroded)
+    return boundary.squeeze(1)
 
 def boundary_weight(masks, width=3, alpha=4.0):
     """
@@ -136,18 +162,50 @@ def boundary_weight(masks, width=3, alpha=4.0):
     returns:
         boundary: [B,H,W] float tensor (0 or 1)
     """
-    x = masks.float().unsqueeze(1)  # [B,1,H,W]
-    dilated = F.max_pool2d(x,kernel_size=width,stride=1,padding=width // 2)
-    eroded = -F.max_pool2d(-x,kernel_size=width,stride=1,padding=width // 2)
-    boundary = (dilated != eroded).float()
-    weight_map = 1.0 + alpha * boundary #weight the boundaries by a factor of alpha
+    boundary = get_boundary(masks, width=width)
+    weight_map = (1.0 + alpha * boundary) #weight the boundaries by a factor of alpha
     return weight_map
+
+def boundary_f_score(pred,target,boundary_width=3,tolerance=3,eps=1e-7):
+    """
+    pred:   [B,H,W] predicted labels
+    target: [B,H,W] ground truth labels
+
+    returns:
+        mean boundary F-score
+    """
+
+    pred_boundary = get_boundary(pred == 1, width=boundary_width).bool()
+
+    gt_boundary = get_boundary(target == 1,width=boundary_width).bool()
+
+    pred_boundary_f = pred_boundary.float().unsqueeze(1)
+    gt_boundary_f = gt_boundary.float().unsqueeze(1)
+
+    pred_dilated = F.max_pool2d(pred_boundary_f, kernel_size=2 * tolerance + 1, stride=1, padding=tolerance).bool()
+
+    gt_dilated = F.max_pool2d(gt_boundary_f, kernel_size=2 * tolerance + 1, stride=1, padding=tolerance).bool()
+
+    precision_match = pred_boundary & gt_dilated.squeeze(1)
+    recall_match = gt_boundary & pred_dilated.squeeze(1)
+
+    precision = (precision_match.sum(dim=(1, 2)).float() / (pred_boundary.sum(dim=(1, 2)).float() + eps))
+    recall = (recall_match.sum(dim=(1, 2)).float() / (gt_boundary.sum(dim=(1, 2)).float() + eps))
+
+    fscore = (2 * precision * recall / (precision + recall + eps))
+
+    empty = ((pred_boundary.sum(dim=(1,2)) == 0) & (gt_boundary.sum(dim=(1,2)) == 0))
+
+    fscore[empty] = 1.0
+    return fscore.mean().item()
+
 
 def train(model, train_loader, optimizer, scaler, ema, alpha, device, classes=2):
     model.train()
 
     total_loss = 0.0
     total_iou = 0.0
+    total_f = 0.0
     count = 0
     
     dice_loss_func = DiceLoss(mode="binary", from_logits=True)
@@ -162,7 +220,8 @@ def train(model, train_loader, optimizer, scaler, ema, alpha, device, classes=2)
         with torch.autocast(device_type='cuda', dtype=torch.float16):
             logits = model(images)
             boundary_weights = boundary_weight(masks, alpha=alpha)
-            ce_loss = torch.nn.functional.cross_entropy(logits, masks)
+            boundary_weights = boundary_weights / boundary_weights.mean()
+            ce_loss = (F.cross_entropy(logits, masks, reduction="none") * boundary_weights).mean()
             foreground_logits = logits[:, 1:2]
             dice_loss = dice_loss_func(foreground_logits, masks)
             loss = ce_loss + dice_loss
@@ -175,67 +234,76 @@ def train(model, train_loader, optimizer, scaler, ema, alpha, device, classes=2)
         preds = logits.argmax(dim=1)
 
         iou = compute_iou(preds, masks, num_classes=classes)
+        boundary_f = boundary_f_score(preds, masks)
 
         total_loss += loss.item()
         total_iou += iou
+        total_f += boundary_f
         count += 1
 
         pbar.set_postfix(
             loss=f"{loss.item():.4f}",
-            miou=f"{iou:.4f}"
+            miou=f"{iou:.4f}",
+            boundary_f=f"{boundary_f:.4f}"
         )
 
-    return total_loss / count, total_iou / count
+    return total_loss / count, total_iou / count, total_f / count
 
 def validate(model, val_loader, device):
     model.eval()
 
     total_loss = 0.0
     total_iou = 0.0
+    total_f = 0.0
     count = 0
 
     dice_loss_func = DiceLoss(mode="binary", from_logits=True)
     with torch.no_grad():
         pbar = tqdm(val_loader, desc="Validating")
 
-        for images, masks, shape in pbar:
+        for images, masks in pbar:
             images = images.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
             
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 logits = model(images)
-                logits_resized = F.interpolate(
-                    logits,
-                    size=shape,
-                    mode="bilinear",
-                    align_corners=False
-                )
-                ce_loss = torch.nn.functional.cross_entropy(logits_resized, masks)
-                foreground_logits = logits_resized[:, 1:2]
+                # logits = F.interpolate(
+                #     logits,
+                #     size=shape,
+                #     mode="bilinear",
+                #     align_corners=False
+                # )
+                boundary_weights = boundary_weight(masks, alpha=alpha)
+                boundary_weights = boundary_weights / boundary_weights.mean()
+                ce_loss = (F.cross_entropy(logits, masks, reduction="none") * boundary_weights).mean()
+                foreground_logits = logits[:, 1:2]
                 dice_loss = dice_loss_func(foreground_logits, masks)
                 loss = ce_loss + dice_loss
 
-            preds = logits_resized.argmax(dim=1)
+            preds = logits.argmax(dim=1)
             iou = compute_iou(preds, masks, num_classes=2)
+            boundary_f = boundary_f_score(preds, masks)
 
             total_loss += loss.item()
             total_iou += iou
+            total_f += boundary_f
             count += 1
 
             pbar.set_postfix(
                 loss=f"{loss.item():.4f}",
-                miou=f"{iou:.4f}"
+                miou=f"{iou:.4f}",
+                boundary_f=f"{boundary_f:.4f}"
             )
 
-    return total_loss / count, total_iou / count
+    return total_loss / count, total_iou / count, total_f / count
 
 if __name__ == "__main__":
     batch_size = 64
-    epochs = 30
-    unfreeze_epoch = 1
+    epochs = 50
+    unfreeze_epoch = 10
     checkpoint_path = "models/segmentation"
-    model_name = "model_v2"
-    encoder_weights = None# "models/supervised/encoder_v2.pt"
+    model_name = "model_delete"
+    encoder_weights = None # "models/supervised/encoder_v3.pt"
     prev_weights = "models/segmentation/model_1.pt"
     alpha = 4.0 #weight for boundary pixels
     
@@ -252,6 +320,7 @@ if __name__ == "__main__":
 
     train_transform = v2.Compose([
         v2.ToImage(),
+        #v2.Resize((224,224)),
         v2.RandomResizedCrop(224, scale=(0.8,1.0)),
         v2.RandomHorizontalFlip(p=0.5),
         v2.ToDtype(torch.float32, scale=True),
@@ -268,12 +337,12 @@ if __name__ == "__main__":
     )
 
 
-    val_dataset = SemanticEvalDataset(
+    val_dataset = SemanticImageDataset(
         data_path=val_path,
         json_file=val_json,
         transform=v2.Compose([
             v2.Resize((224,224)),
-            #v2.CenterCrop(224)
+            #v2.CenterCrop(224),
             v2.ToImage(),
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(
@@ -282,6 +351,21 @@ if __name__ == "__main__":
             )
         ])
     )
+    
+    # val_dataset = SemanticEvalDataset(
+    #     data_path=val_path,
+    #     json_file=val_json,
+    #     transform=v2.Compose([
+    #         v2.Resize((224,224)),
+    #         #v2.CenterCrop(224)
+    #         v2.ToImage(),
+    #         v2.ToDtype(torch.float32, scale=True),
+    #         v2.Normalize(
+    #             mean=[0.485, 0.456, 0.406],
+    #             std=[0.229, 0.224, 0.225]
+    #         )
+    #     ])
+    # )
 
     train_loader = DataLoader(
         train_dataset,
@@ -294,7 +378,7 @@ if __name__ == "__main__":
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=1, #due to varying sizes of masks
+        batch_size=32, #due to varying sizes of masks
         shuffle=False,
         num_workers=4,
         pin_memory=True,
@@ -336,19 +420,19 @@ if __name__ == "__main__":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs-epoch)
         
 
-        train_loss, train_iou = train(model, train_loader, optimizer, scaler, ema, alpha, device)
-        val_loss, val_iou = validate(ema.module, val_loader, device)
+        train_loss, train_iou, train_f = 0,0,0 #train(model, train_loader, optimizer, scaler, ema, alpha, device)
+        val_loss, val_iou, val_f = validate(model, val_loader, device)
         scheduler.step()
         
         print(f"Epoch {epoch+1}/{epochs} - LR: {optimizer.param_groups[0]['lr']:.6f}")
-        print(f"Train Loss: {train_loss:.4f}, Train IOU: {train_iou:.2f}")
-        print(f"Val Loss: {val_loss:.4f}, Val IOU: {val_iou:.2f}")
+        print(f"Train Loss: {train_loss:.4f}, Train IOU: {train_iou:.2f}, Train Boundary F: {train_f:.2f}")
+        print(f"Val Loss: {val_loss:.4f}, Val IOU: {val_iou:.2f}, Val Boundary F: {val_f:.2f}")
         # Save checkpoint
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save({
                 "epoch": epoch,
-                "model": ema.module.state_dict(),
+                "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
             }, f"{checkpoint_path}/{model_name}.pt")
