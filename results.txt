@@ -1,6 +1,6 @@
 submit 1: 0.10634
 segmenter - model_1.pt
-supervised - model_1.pt
+classifier - model_1.pt
 {
   "automated_score": 0.11344389346255687,
   "boundary_f_score": 0.17072677483592125,
@@ -15,8 +15,9 @@ python starter/validate_submission_csv.py \
   --data-root /home/tony/.cache/kagglehub/competitions/cse-164-final-project-2026/data \
   --split val
 
-segmenter - model_1.pt
-supervised - model_v3.pt
+submit 2: 0.11427
+segmenter - model_v2.pt
+classifier - model_v3.pt
 {
   "automated_score": 0.126084711628409,
   "boundary_f_score": 0.17072677483592125,
@@ -24,4 +25,40 @@ supervised - model_v3.pt
   "mean_iou": 0.09379170422478086,
   "rare_class_miou": 0.06511944877958208,
   "segmentation_score": 0.10631149280248907
+}
+
+
+segmenter - model_v2
+classifier - goat_classifier.py
+{
+  "automated_score": 0.4489550807655285,
+  "boundary_f_score": 0.17468975270039094,
+  "classification_macro_accuracy": 0.915,
+  "mean_iou": 0.44875724612262047,
+  "rare_class_miou": 0.3086780683912824,
+  "segmentation_score": 0.37993582966504075
+}
+
+submit 3: 0.16133
+segmenter - model_v2
+classifier - pseudo_v2.pt
+{
+  "automated_score": 0.18049003178662346,
+  "boundary_f_score": 0.17468975270039094,
+  "classification_macro_accuracy": 0.35722222222222216,
+  "mean_iou": 0.15668662835770386,
+  "rare_class_miou": 0.11160820098356294,
+  "segmentation_score": 0.15577941048882718
+}
+
+submit 4: 0.17715
+segmenter - model_v2
+classifier - pseudo_v3.pt
+{
+  "automated_score": 0.19638045120363537,
+  "boundary_f_score": 0.17468975270039094,
+  "classification_macro_accuracy": 0.3872222222222222,
+  "mean_iou": 0.17364799598680777,
+  "rare_class_miou": 0.13417033353714866,
+  "segmentation_score": 0.16990858108455847
 }
