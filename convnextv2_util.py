@@ -1,4 +1,4 @@
-"""code from convnextv2 github"""
+"""code from convnextv2 github: https://github.com/facebookresearch/ConvNeXt-V2/tree/main"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
