@@ -37,12 +37,11 @@ class ConvNeXtClassifier(nn.Module):
     def __init__(self, num_classes=300, encoder_weights=None, drop_path_rate=0):
         super().__init__()
 
-        # self.encoder = convnext_tiny(weights='ConvNeXt_Tiny_Weights.DEFAULT').features
         self.encoder = timm.create_model("convnextv2_tiny.fcmae",pretrained=False,features_only=True)
         if encoder_weights:
             checkpoint = torch.load(encoder_weights, map_location="cpu", weights_only=True)
             self.encoder.load_state_dict(checkpoint)
-        # self.head = nn.Linear(768, num_classes)
+            
         self.head = nn.Sequential(
             nn.Linear(768, 512),
             nn.GELU(),

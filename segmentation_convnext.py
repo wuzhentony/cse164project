@@ -55,36 +55,6 @@ class SemanticImageDataset(Dataset):
 
         return image, mask
 
-class SemanticEvalDataset(Dataset):
-    def __init__(self, json_file, data_path, transform=None):
-        with open(json_file, 'r') as f:
-            self.samples = json.load(f)
-        self.data_path = data_path
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        # image
-        image_path = os.path.join(self.data_path, sample['image'])
-        image = Image.open(image_path).convert('RGB')
-        # mask
-        mask_path = os.path.join(self.data_path, sample['mask'])
-        mask = np.asarray(Image.open(mask_path).convert("RGB"), dtype=np.int32)
-
-        mask = mask[:, :, 0] + 256 * mask[:, :, 1]
-        mask[mask == 1000] = 0
-        mask = (mask != 0).astype(np.int64)   # binary segmentation
-        mask = torch.from_numpy(mask).long()
-
-        if self.transform:
-            image = self.transform(image)
-
-        return image, mask, mask.shape[-2:]
-
-
 class ConvNeXtV2UPerNet(nn.Module):
     def __init__(self, num_classes, encoder_weights=None):
         super().__init__()
@@ -139,15 +109,21 @@ def compute_iou(pred, target, num_classes=2, eps=1e-7):
         image_ious.append(torch.stack(class_ious).mean())
     return torch.stack(image_ious).mean().item()
 
-# def compute_iou(pred, target, num_classes=2):
-    # ious = []
-    # for cls in range(num_classes):
-    #     pred_i = (pred == cls)
-    #     target_i = (target == cls)
-    #     intersection = (pred_i & target_i).sum().item()
-    #     union = (pred_i | target_i).sum().item()
-    #     ious.append(intersection / (union + 1e-7))
-    # return sum(ious) / len(ious) if ious else 0.0
+def class_iou(pred, target, eps=1e-7):
+    B = pred.shape[0]
+    image_ious = []
+    for b in range(B):
+        class_ious = []
+        pred_i = pred[b] == 1
+        target_i = target[b] == 1
+        intersection = (pred_i & target_i).sum().float()
+        union = (pred_i | target_i).sum().float()
+        if union == 0:
+            class_ious.append(torch.tensor(1.0, device=pred.device))
+        else:
+            class_ious.append(intersection / (union + eps))
+        image_ious.append(torch.stack(class_ious).mean())
+    return torch.stack(image_ious).mean().item()
 
 def get_boundary(mask, width=3):
     x = mask.float().unsqueeze(1)
@@ -219,6 +195,7 @@ def train(model, train_loader, optimizer, scaler, ema, alpha, device, classes=2)
 
         with torch.autocast(device_type='cuda', dtype=torch.float16):
             logits = model(images)
+            # ce_loss = F.cross_entropy(logits, masks)
             boundary_weights = boundary_weight(masks, alpha=alpha)
             boundary_weights = boundary_weights / boundary_weights.mean()
             ce_loss = (F.cross_entropy(logits, masks, reduction="none") * boundary_weights).mean()
@@ -255,6 +232,7 @@ def validate(model, val_loader, device):
     total_loss = 0.0
     total_iou = 0.0
     total_f = 0.0
+    total_class_iou = 0
     count = 0
 
     dice_loss_func = DiceLoss(mode="binary", from_logits=True)
@@ -267,12 +245,7 @@ def validate(model, val_loader, device):
             
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 logits = model(images)
-                # logits = F.interpolate(
-                #     logits,
-                #     size=shape,
-                #     mode="bilinear",
-                #     align_corners=False
-                # )
+                # ce_loss = F.cross_entropy(logits, masks)
                 boundary_weights = boundary_weight(masks, alpha=alpha)
                 boundary_weights = boundary_weights / boundary_weights.mean()
                 ce_loss = (F.cross_entropy(logits, masks, reduction="none") * boundary_weights).mean()
@@ -288,6 +261,7 @@ def validate(model, val_loader, device):
             total_iou += iou
             total_f += boundary_f
             count += 1
+            total_class_iou += class_iou(preds, masks)
 
             pbar.set_postfix(
                 loss=f"{loss.item():.4f}",
@@ -295,16 +269,16 @@ def validate(model, val_loader, device):
                 boundary_f=f"{boundary_f:.4f}"
             )
 
-    return total_loss / count, total_iou / count, total_f / count
+    return total_loss / count, total_iou / count, total_f / count, total_class_iou / count
 
 if __name__ == "__main__":
     batch_size = 64
-    epochs = 50
+    epochs = 30
     unfreeze_epoch = 10
     checkpoint_path = "models/segmentation"
     model_name = "model_delete"
     encoder_weights = None # "models/supervised/encoder_v3.pt"
-    prev_weights = "models/segmentation/model_1.pt"
+    prev_weights = "models/segmentation/model_39f.pt"
     alpha = 4.0 #weight for boundary pixels
     
     # Ensure output directory exists
@@ -342,7 +316,6 @@ if __name__ == "__main__":
         json_file=val_json,
         transform=v2.Compose([
             v2.Resize((224,224)),
-            #v2.CenterCrop(224),
             v2.ToImage(),
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(
@@ -351,22 +324,6 @@ if __name__ == "__main__":
             )
         ])
     )
-    
-    # val_dataset = SemanticEvalDataset(
-    #     data_path=val_path,
-    #     json_file=val_json,
-    #     transform=v2.Compose([
-    #         v2.Resize((224,224)),
-    #         #v2.CenterCrop(224)
-    #         v2.ToImage(),
-    #         v2.ToDtype(torch.float32, scale=True),
-    #         v2.Normalize(
-    #             mean=[0.485, 0.456, 0.406],
-    #             std=[0.229, 0.224, 0.225]
-    #         )
-    #     ])
-    # )
-
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -420,13 +377,14 @@ if __name__ == "__main__":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs-epoch)
         
 
-        train_loss, train_iou, train_f = 0,0,0 #train(model, train_loader, optimizer, scaler, ema, alpha, device)
-        val_loss, val_iou, val_f = validate(model, val_loader, device)
+        train_loss, train_iou, train_f = train(model, train_loader, optimizer, scaler, ema, alpha, device)
+        val_loss, val_iou, val_f, val_class_iou = validate(model, val_loader, device)
         scheduler.step()
         
         print(f"Epoch {epoch+1}/{epochs} - LR: {optimizer.param_groups[0]['lr']:.6f}")
         print(f"Train Loss: {train_loss:.4f}, Train IOU: {train_iou:.2f}, Train Boundary F: {train_f:.2f}")
         print(f"Val Loss: {val_loss:.4f}, Val IOU: {val_iou:.2f}, Val Boundary F: {val_f:.2f}")
+        print(f"Class Val IOU: {val_class_iou:.2f}")
         # Save checkpoint
         if val_loss < best_val_loss:
             best_val_loss = val_loss

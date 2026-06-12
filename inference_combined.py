@@ -36,12 +36,6 @@ class CombinedInference:
         clf_checkpoint = torch.load(clf_model_path, map_location="cpu", weights_only=False)
         self.clf_model.load_state_dict(clf_checkpoint["model"])
         self.clf_model.eval()
-
-        # from goat_classifier import GoodClassifier
-        # self.clf_model = GoodClassifier().to(device)
-        # clf_checkpoint = torch.load('models/supervised/goat_classifier.pt', map_location="cpu", weights_only=False)
-        # self.clf_model.load_state_dict(clf_checkpoint["model"])
-        # self.clf_model.eval()
         
         # Preprocessing
         self.transform = v2.Compose([
@@ -237,8 +231,8 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Paths
-    seg_model_path = "/home/tony/project/models/segmentation/model_v2.pt"
-    clf_model_path = "/home/tony/project/models/semi_supervised/pseudo_model_v3.pt"
+    seg_model_path = "/home/tony/project/models/segmentation/model_39f.pt"
+    clf_model_path = "/home/tony/project/models/semi_supervised/pseudo_model_v4.pt"
     test_images_dir = Path("/home/tony/.cache/kagglehub/competitions/cse-164-final-project-2026/data/test/images")
     # test_images_dir = Path("/home/tony/.cache/kagglehub/competitions/cse-164-final-project-2026/data/val/images")
     output_dir = Path("/home/tony/project/test_predictions")
@@ -264,8 +258,8 @@ def main():
         try:
             image_name = image_path.name
             # Run inference
-            class_id, mask = inference.sliding_window_inference(str(image_path))
-            # class_id, mask = inference.interpolate_inference(str(image_path))
+            # class_id, mask = inference.sliding_window_inference(str(image_path))
+            class_id, mask = inference.interpolate_inference(str(image_path))
             segmentation_rle = encode_mask_ids(mask)
             if len(segmentation_rle) < 1:
                 segmentation_rle = f"1 1 {class_id+1}"
@@ -274,9 +268,9 @@ def main():
                 "class_id": class_id,
                 "segmentation_rle": segmentation_rle
             })
-            if (200 < i < 205):
-                inference.save_mask_as_image(mask, output_dir / image_name)
-            i += 1
+            # if (317 < i < 324):
+            #     inference.save_mask_as_image(mask, output_dir / image_name)
+            # i += 1
             
         except Exception as e:
             print(f"  Error processing {image_path}: {e}")
